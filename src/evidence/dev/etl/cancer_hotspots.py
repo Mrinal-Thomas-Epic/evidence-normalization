@@ -5,7 +5,7 @@ import json
 import logging
 from pathlib import Path
 from timeit import default_timer as timer
-from typing import AsyncGenerator, List
+from typing import AsyncGenerator, Dict, List
 
 import pandas as pd
 import requests
@@ -130,20 +130,16 @@ class CancerHotspotsETL(CancerHotspots):
         """
         aa_location_group_cols = ["Hugo_Symbol", "Amino_Acid_Position"]
         grouped_df = df.groupby(aa_location_group_cols).apply(lambda x: x.to_dict('records'), include_groups=False).reset_index(name='Rows')
-        for _, group in grouped_df:           
-            normalized_alleles = map(
-                lambda row: self.normalize_row(variation_normalizer, is_snv, group, row),
-                group["Rows"]
-            )
+        for _, group in grouped_df: 
+            for row in group["Rows"]:
+                normalized_allele = self.normalize_row(variation_normalizer, is_snv, group, row)
+                prot_cons_cat_var = self.construct_cat_var(normalized_allele)
+                row["ProteinSequenceConsequence"] = prot_cons_cat_var
 
-            prot_cons_cat_vars = list(map(
-                self.construct_cat_var,
-                normalized_alleles
-            ))
+            def_loc_cat_var = self._create_loc_cat_var(group["Rows"][0]["ProteinSequenceConsequence"].allele.location)
+            group["DefiningLocationCatVar"] = def_loc_cat_var
 
-            def_loc_cat_var = self._create_loc_cat_var(prot_cons_cat_vars[0].location)
-
-            yield self._create_study_result(def_loc_cat_var, prot_cons_cat_vars)
+            yield self._create_study_result(group)
             
     def _create_loc_cat_var(self, loc: Location):
         def_loc_constraint = DefiningLocationConstraint(
@@ -159,7 +155,7 @@ class CancerHotspotsETL(CancerHotspots):
         )
         return ProteinSequenceConsequence(constraints=[def_allele_constraint])
 
-    def _create_study_result(self, loc_cat_var: CategoricalVariant, protein_seq_cons: List[ProteinSequenceConsequence]):
+    def _create_study_result(self, group: Dict):
         pass
 
     async def normalize_row(self, variation_normalizer, is_snv, group, row):
