@@ -18,7 +18,28 @@ from ga4gh.core.models import MappableConcept, Coding
 from ga4gh.vrs.models import Allele, Location
 from ga4gh.cat_vrs.recipes import ProteinSequenceConsequence
 from ga4gh.cat_vrs.models import CategoricalVariant, DefiningLocationConstraint, DefiningAlleleConstraint
-from ga4gh.va_spec.base import CohortAlleleFrequencyStudyResult
+from ga4gh.va_spec.base import CohortAlleleFrequencyStudyResult, TumorVariantFrequencyStudyResult, DataSet, Document, StudyGroup
+
+class MockQueryHandlerResponse:
+    def __init__(self, variation):
+        self.variation=variation
+
+class MockQueryHandler:
+    async def normalize(self, variation: str):
+        from ga4gh.vrs.models import SequenceLocation, LiteralSequenceExpression
+        
+        variation = Allele(
+            location=SequenceLocation(
+                start=1,
+                end=1,
+                sequenceReference="NP_001191.1"
+            ),
+            state=LiteralSequenceExpression(sequence="A")
+        )
+        return MockQueryHandlerResponse(variation=variation)
+
+    def __init__(self):
+        self.normalize_handler = self
 
 class MockQueryHandlerResponse:
     def __init__(self, variation):
@@ -136,6 +157,19 @@ class CancerHotspotsETL(CancerHotspots):
         end = timer()
         _logger.info("Successfully transformed Cancer Hotspots data in %.*f s", 2, end - start)
 
+    
+    def split_sample_counts(sample_string) -> dict[str, int]: 
+        """Splits cancer hotspot columns in an key1:val1|key2:val2 format into a dictionary
+
+        :param sample_string: String to split. In the format key1:val1|key2:val2 
+        """
+        samples = sample_string.split("|")
+        samples_dict = {}
+        for sample_pair in samples:
+            keyval = sample_pair.split(":")
+            samples_dict[keyval[0]] = keyval[1]
+        return samples_dict
+
 
     async def get_transformed_data(
         self, df: pd.DataFrame, variation_normalizer, is_snv: bool
@@ -148,8 +182,13 @@ class CancerHotspotsETL(CancerHotspots):
         """
         aa_location_group_cols = ["Hugo_Symbol", "Amino_Acid_Position"]
         grouped_df = df.groupby(aa_location_group_cols).apply(lambda x: x.to_dict('records'), include_groups=False).reset_index(name='Rows')
-        for _, group in grouped_df.iterrows(): 
-            normalized_allele = None
+        for _, group in grouped_df:
+            uniqueDf = pd.DataFrame(group["Rows"]).nunique()
+            if uniqueDf["Mutation_Count"] > 1 or uniqueDf["Total_Samples"] > 1:
+                _logger.error (
+                    "Too many mutation count or total sample count values for a locus"
+                )
+
             for row in group["Rows"]:
                 normalized_allele = await self.normalize_row(variation_normalizer, is_snv, group, row)
                 prot_cons_cat_var = self._create_protein_seq_cons(normalized_allele)
@@ -161,6 +200,10 @@ class CancerHotspotsETL(CancerHotspots):
             yield self._create_study_result(group)
             
     def _create_loc_cat_var(self, loc: Location):
+        """Creates a categorical variant given a location
+
+        :param loc: Location of the categorical variant
+        """
         def_loc_constraint = DefiningLocationConstraint(
             location=loc,
             relations=CancerHotspotsETL._cat_var_relations,
@@ -169,14 +212,109 @@ class CancerHotspotsETL(CancerHotspots):
         return CategoricalVariant(constraints=[def_loc_constraint])
     
     def _create_protein_seq_cons(self, p_allele: Allele):
+        """Creates a ProteinSequenceConsequence for an allele
+
+        :param p_allele: Allele
+        """
         def_allele_constraint = DefiningAlleleConstraint(
             allele=p_allele,
             relations=CancerHotspotsETL._cat_var_relations
         )
         return ProteinSequenceConsequence(constraints=[def_allele_constraint])
 
-    def _create_study_result(self, group: Dict):
-        return group["DefiningLocationCatVar"]
+    def _create_study_result(self, group: Dict) -> TumorVariantFrequencyStudyResult:
+        """Creates  top level study result
+
+        :param group: Dataframe group (grouped by gene and protein location)
+        """
+        source_dataset = self.get_cancer_hotspots_dataset()
+        sample_group = self.get_primary_cohort(group)
+        subGroupFreq = self._create_specific_change_study_results(group)
+        numerator = group["Rows"][0]["MutationCount"]
+        denominator = sample_group.memberCount
+        
+        top_level_study_rslt = TumorVariantFrequencyStudyResult(
+            focusVariant=group["DefiningLocationCatVar"],
+            sourceDataSet=source_dataset,
+            affectedTumorSamples=numerator,
+            totalTumorSamples=denominator,
+            affectedFrequency=numerator/denominator,
+            sampleGroup=sample_group,
+            subGroupFrequency=subGroupFreq
+        )
+        return top_level_study_rslt
+
+    def _create_specific_change_study_results(self, group: Dict) -> list[TumorVariantFrequencyStudyResult]:
+        """Creates a study result for a specific variant
+
+        :param group: Dataframe group
+        """
+        source_dataset = self.get_cancer_hotspots_dataset()
+        sample_group = self.get_primary_cohort(group)
+
+        study_results=[]
+        for row in group["Rows"]:
+            numerator = row["Variant_Amino_Acid"].split(":")[1]
+            denominator = sample_group.memberCount
+
+            cancer_type_numbers = self.get_cancer_type_numbers(row)
+            subgroupFreq = self._create_cancer_type_study_results(row, cancer_type_numbers)
+
+            specific_change_study_rslt = TumorVariantFrequencyStudyResult(
+                focusVariant=row["ProteinSequenceConsequence"],
+                sourceDataSet=source_dataset,
+                affectedTumorSamples=numerator,
+                totalTumorSamples=denominator,
+                affectedFrequency=numerator/denominator,
+                sampleGroup=sample_group,
+                subGroupFrequency=subgroupFreq
+            )
+            study_results.append(specific_change_study_rslt)
+
+        return study_results
+    
+    def _create_cancer_type_study_results(self, row, cancer_type_numbers: Dict) -> list[TumorVariantFrequencyStudyResult]:
+        """Creates the study results for a specific variant in the context of a specific cancer type
+
+        :param row: Dataframe row
+        :param cancer_type_numbers: Dictionary of individuals with a given cancer type and variant versus those without the variant
+        """
+        source_dataset = self.get_cancer_hotspots_dataset()
+        sample_group = self.get_cancer_type_cohorts(row)
+
+        cancer_type_results = []
+        for cancer_type in cancer_type_numbers.keys():
+            numerator = cancer_type_numbers[cancer_type][1]
+            denominator = cancer_type_numbers[cancer_type][0]
+       
+            cancer_type_study_rslt = TumorVariantFrequencyStudyResult(
+                focusVariant=row["ProteinSequenceConsequence"],
+                sourceDataSet=source_dataset,
+                affectedTumorSamples=numerator,
+                totalTumorSamples=denominator,
+                affectedFrequency=numerator/denominator,
+                sampleGroup=sample_group,
+            )
+            cancer_type_results.append(cancer_type_study_rslt)
+        return cancer_type_results
+
+
+    def get_cancer_hotspots_dataset(self) -> DataSet:
+        """
+        Adds the dataset information for cancer hotspots. A more elegant way of doing this would be great.
+        """
+        reported_in = Document(
+            title="Accelerating discovery of functional mutant alleles in cancer",
+            urls=["https://pmc.ncbi.nlm.nih.gov/articles/PMC5809279/"],
+            doi="10.1158/2159-8290.CD-17-0321",
+            pmid=29247016
+        )
+        return DataSet(
+            reportedIn=reported_in,
+            releaseDate=datetime.date(year=2017, month=12, day=15),
+            version="v2"
+        )
+
 
     async def normalize_row(self, variation_normalizer, is_snv: bool, group: Dict, row: Dict):
         hugo_symbol = group["Hugo_Symbol"]
@@ -209,3 +347,52 @@ class CancerHotspotsETL(CancerHotspots):
                         "variation-normalizer unable to normalize: %s", variation
                     )
     
+    def construct_cat_var(self, sequence_reference: str, position: str):
+        pass
+
+    def construct_allele(self, sequence_reference: str, position: str, alt: str):
+        pass
+
+    async def get_primary_cohort(self, group) -> StudyGroup:
+        """
+        Adds primary cohort information for each row.
+        """
+        total_samples = group["Rows"][0]["Total_Samples"]
+
+        return StudyGroup(
+            id="All",
+            name="Overall",
+            memberCount=total_samples
+        )
+
+    def get_cancer_type_numbers(self, row) -> Dict:
+        cancer_type_numbers = {}
+
+        organ_types = row["Organ_Types"]
+        sample_types = row["Samples"]
+
+        organ_types_dict = self.split_sample_counts(organ_types)
+        sample_types_dict = self.split_sample_counts(sample_types)
+
+        for key in organ_types_dict.keys():
+            cancer_type_numbers[key] = (organ_types_dict[key], sample_types_dict[key])
+        
+        return cancer_type_numbers
+
+
+    async def get_cancer_type_cohorts(self, row) -> list[StudyGroup]:
+        """
+        Adds cohort information for cancer hotspots for each distinct cancer type.
+        """
+        organ_types = row["Organ_Types"]
+        organ_types_dict = self.split_sample_counts(organ_types)
+
+        cohorts = []
+        for organ_type in organ_types_dict.keys():
+            organ_study_group = StudyGroup(
+                name=organ_type,
+                memberCount=organ_types_dict[organ_type],
+                characteristics=[]
+            )
+            cohorts.append(organ_study_group)
+        return cohorts
