@@ -67,7 +67,6 @@ class CancerHotspotsETL(CancerHotspots):
         )
         fn = self.data_url.split("/")[-1]
         self.data_path = self.src_dir_path / fn
-        self.transformed_data = {}  # vrs_id: hotspot data
 
     def download_data(self) -> None:
         """Download Cancer Hotspots data."""
@@ -82,7 +81,7 @@ class CancerHotspotsETL(CancerHotspots):
                     r.status_code,
                 )
 
-    async def add_vrs_identifier_to_data(self) -> None:
+    async def transform_and_write_hotspots(self) -> None:
         """Normalize variations in cancer hotspots and updates `transformed_data`
 
         Run manually each time variation-normalizer or Cancer Hotspots releases a new
@@ -97,27 +96,25 @@ class CancerHotspotsETL(CancerHotspots):
         indel_hotspots = pd.read_excel(self.data_path, sheet_name="INDEL-hotspots")
         variation_normalizer = QueryHandler()
 
+        _logger.info("Normalizing Cancer Hotspots data...")
+
         today = datetime.datetime.strftime(
             datetime.datetime.now(tz=datetime.UTC), "%Y%m%d"
         )
-        
-
-
-        _logger.info("Normalizing Cancer Hotspots data...")
-        start = timer()
-        await self.get_transformed_data(snv_hotspots, variation_normalizer, is_snv=True)
-        await self.get_transformed_data(
-            indel_hotspots, variation_normalizer, is_snv=False
-        )
-        end = timer()
-
-        _logger.info("Transformed Cancer Hotspots data in %.*f s", 2, end - start)
-
         transformed_data_path = self.src_dir_path / f"cancer_hotspots_{today}.json"
         with transformed_data_path.open("w") as f:
-            json.dump(self.transformed_data, f)
+            start = timer()
+            async for study_result in self.get_transformed_data(snv_hotspots, variation_normalizer, is_snv=True):
+                f.write(study_result.model_dump_json())
+                f.write("\n")
 
-        _logger.info("Successfully transformed Cancer Hotspots data.")
+            async for study_result in self.get_transformed_data(indel_hotspots, variation_normalizer, is_snv=False):
+                f.write(study_result.model_dump_json())
+                f.write("\n")
+
+        end = timer()
+        _logger.info("Successfully transformed Cancer Hotspots data in %.*f s", 2, end - start)
+
 
     async def get_transformed_data(
         self, df: pd.DataFrame, variation_normalizer: QueryHandler, is_snv: bool
