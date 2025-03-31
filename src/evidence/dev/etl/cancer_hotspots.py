@@ -5,20 +5,41 @@ import json
 import logging
 from pathlib import Path
 from timeit import default_timer as timer
-from typing import AsyncGenerator, Dict, List
+from typing import AsyncGenerator, Dict
 
 import pandas as pd
 import requests
-from variation.query import QueryHandler
+# from variation.query import QueryHandler
 
 from evidence import DATA_DIR_PATH
 from evidence.data_sources import CancerHotspots
 
-from ga4gh.core.models import MappableConcept, ConceptMapping, Coding, Relation
+from ga4gh.core.models import MappableConcept, Coding
 from ga4gh.vrs.models import Allele, Location
 from ga4gh.cat_vrs.recipes import ProteinSequenceConsequence
 from ga4gh.cat_vrs.models import CategoricalVariant, DefiningLocationConstraint, DefiningAlleleConstraint
 from ga4gh.va_spec.base import CohortAlleleFrequencyStudyResult
+
+class MockQueryHandlerResponse:
+    def __init__(self, variation):
+        self.variation=variation
+
+class MockQueryHandler:
+    async def normalize(self, variation: str):
+        from ga4gh.vrs.models import SequenceLocation, LiteralSequenceExpression
+        
+        variation = Allele(
+            location=SequenceLocation(
+                start=1,
+                end=1,
+                sequenceReference="NP_001191.1"
+            ),
+            state=LiteralSequenceExpression(sequence="A")
+        )
+        return MockQueryHandlerResponse(variation=variation)
+
+    def __init__(self):
+        self.normalize_handler = self
 
 class CancerHotspotsETLError(Exception):
     """Exceptions for Cancer Hotspots ETL"""
@@ -32,18 +53,18 @@ class CancerHotspotsETL(CancerHotspots):
 
     _cat_var_relations = [
         MappableConcept(
-            primaryCode="translation_of",
-            mappings=[
-                ConceptMapping(
-                    coding=Coding(
-                        code="translate_of",
-                        system="http://www.sequenceontology.org"
-                    ),
-                    relation=Relation.EXACT_MATCH
-                )
-            ]
+            primaryCoding=Coding(
+                code="translation_of",
+                system="http://www.sequenceontology.org"
+            )
         )
     ]
+    _cat_var_match_characteristic = MappableConcept(
+        primaryCoding=Coding(
+            code="exactMatch",
+            system="http://www.sequenceontology.org" # TODO
+        )
+    )
 
     def __init__(
         self,
@@ -94,7 +115,7 @@ class CancerHotspotsETL(CancerHotspots):
 
         snv_hotspots = pd.read_excel(self.data_path, sheet_name="SNV-hotspots")
         indel_hotspots = pd.read_excel(self.data_path, sheet_name="INDEL-hotspots")
-        variation_normalizer = QueryHandler()
+        variation_normalizer = MockQueryHandler() # QueryHandler()
 
         _logger.info("Normalizing Cancer Hotspots data...")
 
@@ -117,7 +138,7 @@ class CancerHotspotsETL(CancerHotspots):
 
 
     async def get_transformed_data(
-        self, df: pd.DataFrame, variation_normalizer: QueryHandler, is_snv: bool
+        self, df: pd.DataFrame, variation_normalizer, is_snv: bool
     ) -> AsyncGenerator[CohortAlleleFrequencyStudyResult, None]:
         """Normalize variant and updates `transformed_data`
 
@@ -127,13 +148,14 @@ class CancerHotspotsETL(CancerHotspots):
         """
         aa_location_group_cols = ["Hugo_Symbol", "Amino_Acid_Position"]
         grouped_df = df.groupby(aa_location_group_cols).apply(lambda x: x.to_dict('records'), include_groups=False).reset_index(name='Rows')
-        for _, group in grouped_df: 
+        for _, group in grouped_df.iterrows(): 
+            normalized_allele = None
             for row in group["Rows"]:
-                normalized_allele = self.normalize_row(variation_normalizer, is_snv, group, row)
-                prot_cons_cat_var = self.construct_cat_var(normalized_allele)
+                normalized_allele = await self.normalize_row(variation_normalizer, is_snv, group, row)
+                prot_cons_cat_var = self._create_protein_seq_cons(normalized_allele)
                 row["ProteinSequenceConsequence"] = prot_cons_cat_var
 
-            def_loc_cat_var = self._create_loc_cat_var(group["Rows"][0]["ProteinSequenceConsequence"].allele.location)
+            def_loc_cat_var = self._create_loc_cat_var(normalized_allele.location)
             group["DefiningLocationCatVar"] = def_loc_cat_var
 
             yield self._create_study_result(group)
@@ -141,7 +163,8 @@ class CancerHotspotsETL(CancerHotspots):
     def _create_loc_cat_var(self, loc: Location):
         def_loc_constraint = DefiningLocationConstraint(
             location=loc,
-            relations=CancerHotspotsETL._cat_var_relations
+            relations=CancerHotspotsETL._cat_var_relations,
+            matchCharacteristic=CancerHotspotsETL._cat_var_match_characteristic
         )
         return CategoricalVariant(constraints=[def_loc_constraint])
     
@@ -153,9 +176,9 @@ class CancerHotspotsETL(CancerHotspots):
         return ProteinSequenceConsequence(constraints=[def_allele_constraint])
 
     def _create_study_result(self, group: Dict):
-        pass
+        return group["DefiningLocationCatVar"]
 
-    async def normalize_row(self, variation_normalizer, is_snv, group, row):
+    async def normalize_row(self, variation_normalizer, is_snv: bool, group: Dict, row: Dict):
         hugo_symbol = group["Hugo_Symbol"]
         pos = group["Amino_Acid_Position"]
         alt = row["Variant_Amino_Acid"].split(':')[0]
@@ -186,9 +209,3 @@ class CancerHotspotsETL(CancerHotspots):
                         "variation-normalizer unable to normalize: %s", variation
                     )
     
-    def construct_cat_var(self, sequence_reference: str, position: str):
-        pass
-
-    def construct_allele(self, sequence_reference: str, position: str, alt: str):
-        pass
-
