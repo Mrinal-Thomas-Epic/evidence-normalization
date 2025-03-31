@@ -5,6 +5,7 @@ import json
 import logging
 from pathlib import Path
 from timeit import default_timer as timer
+from typing import AsyncGenerator, List
 
 import pandas as pd
 import requests
@@ -13,6 +14,11 @@ from variation.query import QueryHandler
 from evidence import DATA_DIR_PATH
 from evidence.data_sources import CancerHotspots
 
+from ga4gh.core.models import MappableConcept, ConceptMapping, Coding
+from ga4gh.vrs.models import Allele, Location
+from ga4gh.cat_vrs.recipes import ProteinSequenceConsequence
+from ga4gh.cat_vrs.models import CategoricalVariant, DefiningLocationConstraint, DefiningAlleleConstraint
+from ga4gh.va_spec.base import CohortAlleleFrequencyStudyResult
 
 class CancerHotspotsETLError(Exception):
     """Exceptions for Cancer Hotspots ETL"""
@@ -23,6 +29,20 @@ _logger = logging.getLogger(__name__)
 
 class CancerHotspotsETL(CancerHotspots):
     """Class for Cancer Hotspots ETL methods."""
+
+    _cat_var_relations = [
+        MappableConcept(
+            primaryCode="translation_of",
+            mappings=[
+                ConceptMapping(
+                    coding=Coding(
+                        code="translate_of",
+                        system="http://www.sequenceontology.org"
+                    )
+                )
+            ]
+        )
+    ]
 
     def __init__(
         self,
@@ -76,6 +96,12 @@ class CancerHotspotsETL(CancerHotspots):
         indel_hotspots = pd.read_excel(self.data_path, sheet_name="INDEL-hotspots")
         variation_normalizer = QueryHandler()
 
+        today = datetime.datetime.strftime(
+            datetime.datetime.now(tz=datetime.UTC), "%Y%m%d"
+        )
+        
+
+
         _logger.info("Normalizing Cancer Hotspots data...")
         start = timer()
         await self.get_transformed_data(snv_hotspots, variation_normalizer, is_snv=True)
@@ -86,9 +112,6 @@ class CancerHotspotsETL(CancerHotspots):
 
         _logger.info("Transformed Cancer Hotspots data in %.*f s", 2, end - start)
 
-        today = datetime.datetime.strftime(
-            datetime.datetime.now(tz=datetime.UTC), "%Y%m%d"
-        )
         transformed_data_path = self.src_dir_path / f"cancer_hotspots_{today}.json"
         with transformed_data_path.open("w") as f:
             json.dump(self.transformed_data, f)
@@ -97,60 +120,81 @@ class CancerHotspotsETL(CancerHotspots):
 
     async def get_transformed_data(
         self, df: pd.DataFrame, variation_normalizer: QueryHandler, is_snv: bool
-    ) -> None:
+    ) -> AsyncGenerator[CohortAlleleFrequencyStudyResult]:
         """Normalize variant and updates `transformed_data`
 
         :param df: Dataframe to transform
         :param variation_normalizer: Variation Normalizer handler
         :param is_snv: `True` if SNV data, else INDEL
         """
-        for _, row in df.iterrows():
-            hugo_symbol = row["Hugo_Symbol"]
-            alt = row["Variant_Amino_Acid"]
-            pos = row["Amino_Acid_Position"]
+        aa_location_group_cols = ["Hugo_Symbol", "Amino_Acid_Position"]
+        grouped_df = df.groupby(aa_location_group_cols).apply(lambda x: x.to_dict('records'), include_groups=False).reset_index(name='Rows')
+        for _, group in grouped_df:           
+            normalized_alleles = map(
+                lambda row: self.normalize_row(variation_normalizer, is_snv, group, row),
+                group["Rows"]
+            )
 
-            if is_snv:
-                ref = row["ref"]
-                variation = f"{hugo_symbol} {ref}{pos}{alt.split(':')[0]}"
-            else:
-                ref = None
-                variation = f"{hugo_symbol} {alt.split(':')[0]}"
+            prot_cons_cat_vars = list(map(
+                self.construct_cat_var,
+                normalized_alleles
+            ))
 
-            try:
-                variation_norm_resp = (
+            def_loc_cat_var = self._create_loc_cat_var(prot_cons_cat_vars[0].location)
+
+            yield self._create_study_result(def_loc_cat_var, prot_cons_cat_vars)
+            
+    def _create_loc_cat_var(self, loc: Location):
+        def_loc_constraint = DefiningLocationConstraint(
+            location=loc,
+            relations=CancerHotspotsETL._cat_var_relations
+        )
+        return CategoricalVariant(constraints=[def_loc_constraint])
+    
+    def _create_protein_seq_cons(self, p_allele: Allele):
+        def_allele_constraint = DefiningAlleleConstraint(
+            allele=p_allele,
+            relations=CancerHotspotsETL._cat_var_relations
+        )
+        return ProteinSequenceConsequence(constraints=[def_allele_constraint])
+
+    def _create_study_result(self, loc_cat_var: CategoricalVariant, protein_seq_cons: List[ProteinSequenceConsequence]):
+        pass
+
+    async def normalize_row(self, variation_normalizer, is_snv, group, row):
+        hugo_symbol = group["Hugo_Symbol"]
+        pos = group["Amino_Acid_Position"]
+        alt = row["Variant_Amino_Acid"].split(':')[0]
+
+        if is_snv:
+            ref = row["ref"]
+            variation = f"{hugo_symbol} {ref}{pos}{alt.split(':')[0]}"
+        else:
+            ref = None
+            variation = f"{hugo_symbol} {alt.split(':')[0]}"
+
+        try:
+            variation_norm_resp = (
                     await variation_normalizer.normalize_handler.normalize(variation)
                 )
-            except Exception as e:
-                _logger.error(
+
+        except Exception as e:
+            _logger.error(
                     "variation-normalizer unable to normalize %s: %s", variation, str(e)
                 )
+
+        else:
+            if variation_norm_resp and variation_norm_resp.variation:
+                return variation_norm_resp.variation
+                
             else:
-                if variation_norm_resp and variation_norm_resp.variation:
-                    vrs_id = variation_norm_resp.variation.id
-                    if vrs_id in self.transformed_data:
-                        _logger.debug(
-                            "duplicate vrs_id (%s) for variation (%s)",
-                            vrs_id,
-                            variation,
-                        )
-
-                    mutation, observations = alt.split(":")
-
-                    if is_snv:
-                        codon = f"{ref}{pos}"
-                        mutation = f"{codon}{mutation}"
-                    else:
-                        codon = pos
-
-                    self.transformed_data[vrs_id] = {
-                        "variation": variation,
-                        "codon": codon,
-                        "mutation": mutation,
-                        "q_value": float(row["qvalue"]),
-                        "observations": int(observations),
-                        "total_observations": int(row["Mutation_Count"]),
-                    }
-                else:
-                    _logger.warning(
+                _logger.warning(
                         "variation-normalizer unable to normalize: %s", variation
                     )
+    
+    def construct_cat_var(self, sequence_reference: str, position: str):
+        pass
+
+    def construct_allele(self, sequence_reference: str, position: str, alt: str):
+        pass
+
