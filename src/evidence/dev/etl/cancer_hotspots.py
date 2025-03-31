@@ -14,7 +14,7 @@ from variation.query import QueryHandler
 from evidence import DATA_DIR_PATH
 from evidence.data_sources import CancerHotspots
 
-from ga4gh.core.models import MappableConcept, ConceptMapping, Coding
+from ga4gh.core.models import MappableConcept, ConceptMapping, Coding, Relation
 from ga4gh.vrs.models import Allele, Location
 from ga4gh.cat_vrs.recipes import ProteinSequenceConsequence
 from ga4gh.cat_vrs.models import CategoricalVariant, DefiningLocationConstraint, DefiningAlleleConstraint
@@ -38,7 +38,8 @@ class CancerHotspotsETL(CancerHotspots):
                     coding=Coding(
                         code="translate_of",
                         system="http://www.sequenceontology.org"
-                    )
+                    ),
+                    relation=Relation.EXACT_MATCH
                 )
             ]
         )
@@ -120,7 +121,7 @@ class CancerHotspotsETL(CancerHotspots):
 
     async def get_transformed_data(
         self, df: pd.DataFrame, variation_normalizer: QueryHandler, is_snv: bool
-    ) -> AsyncGenerator[CohortAlleleFrequencyStudyResult]:
+    ) -> AsyncGenerator[CohortAlleleFrequencyStudyResult, None]:
         """Normalize variant and updates `transformed_data`
 
         :param df: Dataframe to transform
