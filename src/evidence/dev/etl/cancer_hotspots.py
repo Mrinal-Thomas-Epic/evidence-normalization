@@ -230,14 +230,14 @@ class CancerHotspotsETL(CancerHotspots):
         source_dataset = self.get_cancer_hotspots_dataset()
         sample_group = self.get_primary_cohort(group)
         subGroupFreq = self._create_specific_change_study_results(group)
-        numerator = group["Rows"][0]["MutationCount"]
+        numerator = group["Rows"][0]["Mutation_Count"]
         denominator = sample_group.memberCount
         
         top_level_study_rslt = TumorVariantFrequencyStudyResult(
             focusVariant=group["DefiningLocationCatVar"],
             sourceDataSet=source_dataset,
-            affectedTumorSamples=numerator,
-            totalTumorSamples=denominator,
+            affectedSampleCount=numerator,
+            totalSampleCount=denominator,
             affectedFrequency=numerator/denominator,
             sampleGroup=sample_group,
             subGroupFrequency=subGroupFreq
@@ -254,17 +254,18 @@ class CancerHotspotsETL(CancerHotspots):
 
         study_results=[]
         for row in group["Rows"]:
-            numerator = row["Variant_Amino_Acid"].split(":")[1]
+            numerator = int(row["Variant_Amino_Acid"].split(":")[1])
             denominator = sample_group.memberCount
 
             cancer_type_numbers = self.get_cancer_type_numbers(row)
             subgroupFreq = self._create_cancer_type_study_results(row, cancer_type_numbers)
 
+            cat_var = CategoricalVariant(**row["ProteinSequenceConsequence"].model_dump())
             specific_change_study_rslt = TumorVariantFrequencyStudyResult(
-                focusVariant=row["ProteinSequenceConsequence"],
+                focusVariant=cat_var,
                 sourceDataSet=source_dataset,
-                affectedTumorSamples=numerator,
-                totalTumorSamples=denominator,
+                affectedSampleCount=numerator,
+                totalSampleCount=denominator,
                 affectedFrequency=numerator/denominator,
                 sampleGroup=sample_group,
                 subGroupFrequency=subgroupFreq
@@ -286,14 +287,14 @@ class CancerHotspotsETL(CancerHotspots):
         for cancer_type in cancer_type_numbers.keys():
             numerator = int(cancer_type_numbers[cancer_type][1])
             denominator = int(cancer_type_numbers[cancer_type][0])
-       
+            cat_var = CategoricalVariant(**row["ProteinSequenceConsequence"].model_dump())
             cancer_type_study_rslt = TumorVariantFrequencyStudyResult(
-                focusVariant=row["ProteinSequenceConsequence"],
+                focusVariant=cat_var,
                 sourceDataSet=source_dataset,
                 affectedSampleCount=numerator,
                 totalSampleCount=denominator,
                 affectedFrequency=numerator/denominator,
-                sampleGroup=sample_group,
+                sampleGroup=sample_group[0],
             )
             cancer_type_results.append(cancer_type_study_rslt)
         return cancer_type_results
