@@ -281,7 +281,6 @@ class CancerHotspotsETL(CancerHotspots):
         :param cancer_type_numbers: Dictionary of individuals with a given cancer type and variant versus those without the variant
         """
         source_dataset = self.get_cancer_hotspots_dataset()
-        sample_group = self.get_cancer_type_cohorts(row)
 
         cancer_type_results = []
         for cancer_type in cancer_type_numbers.keys():
@@ -294,7 +293,7 @@ class CancerHotspotsETL(CancerHotspots):
                 affectedSampleCount=numerator,
                 totalSampleCount=denominator,
                 affectedFrequency=numerator/denominator,
-                sampleGroup=sample_group[0],
+                sampleGroup=self.get_cancer_type_cohort(row, cancer_type, denominator),
             )
             cancer_type_results.append(cancer_type_study_rslt)
         return cancer_type_results
@@ -376,24 +375,26 @@ class CancerHotspotsETL(CancerHotspots):
         sample_types_dict = self.split_sample_counts(sample_types)
 
         for key in organ_types_dict.keys():
-            cancer_type_numbers[key] = (organ_types_dict[key], sample_types_dict[key])
+            cancer_type_numbers[key] = (organ_types_dict[key], sample_types_dict.get(key, 0))
         
         return cancer_type_numbers
 
 
-    def get_cancer_type_cohorts(self, row) -> list[StudyGroup]:
+    def get_cancer_type_cohort(self, row, cancer_type: str, member_Count: int) -> StudyGroup:
         """
-        Adds cohort information for cancer hotspots for each distinct cancer type.
+        Adds cohort information for cancer hotspots for a distinct cancer type.
         """
-        organ_types = row["Organ_Types"]
-        organ_types_dict = self.split_sample_counts(organ_types)
-
-        cohorts = []
-        for organ_type in organ_types_dict.keys():
-            organ_study_group = StudyGroup(
-                name=organ_type,
-                memberCount=organ_types_dict[organ_type],
-                characteristics=[]
-            )
-            cohorts.append(organ_study_group)
-        return cohorts
+        primary_coding = Coding(
+            code=cancer_type,
+            system="OncoTree"
+        )
+        characteristic = MappableConcept(
+            conceptType="disease",
+            name=cancer_type,
+            primaryCoding=primary_coding
+        )
+        return StudyGroup(
+            name=cancer_type,
+            memberCount=member_Count,
+            characteristics=[characteristic]
+        )
