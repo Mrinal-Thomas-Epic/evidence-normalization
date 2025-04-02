@@ -147,18 +147,18 @@ class CancerHotspotsETL(CancerHotspots):
         with transformed_data_path.open("w") as f:
             start = timer()
             async for study_result in self.get_transformed_data(snv_hotspots, variation_normalizer, is_snv=True):
-                f.write(study_result.model_dump_json())
+                f.write(study_result.model_dump_json(exclude_none=True))
                 f.write("\n")
 
             async for study_result in self.get_transformed_data(indel_hotspots, variation_normalizer, is_snv=False):
-                f.write(study_result.model_dump_json())
+                f.write(study_result.model_dump_json(exclude_none=True))
                 f.write("\n")
 
         end = timer()
         _logger.info("Successfully transformed Cancer Hotspots data in %.*f s", 2, end - start)
 
     
-    def split_sample_counts(sample_string) -> dict[str, int]: 
+    def split_sample_counts(self, sample_string) -> dict[str, int]: 
         """Splits cancer hotspot columns in an key1:val1|key2:val2 format into a dictionary
 
         :param sample_string: String to split. In the format key1:val1|key2:val2 
@@ -182,7 +182,7 @@ class CancerHotspotsETL(CancerHotspots):
         """
         aa_location_group_cols = ["Hugo_Symbol", "Amino_Acid_Position"]
         grouped_df = df.groupby(aa_location_group_cols).apply(lambda x: x.to_dict('records'), include_groups=False).reset_index(name='Rows')
-        for _, group in grouped_df:
+        for _, group in grouped_df.iterrows():
             uniqueDf = pd.DataFrame(group["Rows"]).nunique()
             if uniqueDf["Mutation_Count"] > 1 or uniqueDf["Total_Samples"] > 1:
                 _logger.error (
@@ -284,14 +284,14 @@ class CancerHotspotsETL(CancerHotspots):
 
         cancer_type_results = []
         for cancer_type in cancer_type_numbers.keys():
-            numerator = cancer_type_numbers[cancer_type][1]
-            denominator = cancer_type_numbers[cancer_type][0]
+            numerator = int(cancer_type_numbers[cancer_type][1])
+            denominator = int(cancer_type_numbers[cancer_type][0])
        
             cancer_type_study_rslt = TumorVariantFrequencyStudyResult(
                 focusVariant=row["ProteinSequenceConsequence"],
                 sourceDataSet=source_dataset,
-                affectedTumorSamples=numerator,
-                totalTumorSamples=denominator,
+                affectedSampleCount=numerator,
+                totalSampleCount=denominator,
                 affectedFrequency=numerator/denominator,
                 sampleGroup=sample_group,
             )
@@ -353,7 +353,7 @@ class CancerHotspotsETL(CancerHotspots):
     def construct_allele(self, sequence_reference: str, position: str, alt: str):
         pass
 
-    async def get_primary_cohort(self, group) -> StudyGroup:
+    def get_primary_cohort(self, group) -> StudyGroup:
         """
         Adds primary cohort information for each row.
         """
@@ -380,7 +380,7 @@ class CancerHotspotsETL(CancerHotspots):
         return cancer_type_numbers
 
 
-    async def get_cancer_type_cohorts(self, row) -> list[StudyGroup]:
+    def get_cancer_type_cohorts(self, row) -> list[StudyGroup]:
         """
         Adds cohort information for cancer hotspots for each distinct cancer type.
         """
